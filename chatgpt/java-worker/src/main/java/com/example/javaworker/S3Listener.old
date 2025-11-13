@@ -1,0 +1,152 @@
+package com.example.javaworker;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.*;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+@Component
+public class S3Listener {
+
+    @Value("${S3_ENDPOINT:http://localstack:4566}")
+    private String s3Endpoint;
+
+    @Value("${S3_BUCKET_NAME:documents}")
+    private String bucketName;
+
+    @Value("${AWS_REGION:us-east-1}")
+    private String awsRegion;
+
+    @Value("${CHROMA_SERVICE_URL:http://chroma-service:9000}")
+    private String chromaServiceUrl;
+
+    private S3Client s3;
+    private Set<String> processedKeys = new HashSet<>();
+    private HttpClient httpClient;
+    private ObjectMapper objectMapper;
+
+    @PostConstruct
+    public void init() {
+        s3 = S3Client.builder()
+                .endpointOverride(URI.create(s3Endpoint))
+                .region(Region.of(awsRegion))
+                .credentialsProvider(
+                        StaticCredentialsProvider.create(
+                                AwsBasicCredentials.create("test", "test")
+                        )
+                )
+                .forcePathStyle(true)
+                .build();
+
+        try {
+            s3.headBucket(HeadBucketRequest.builder().bucket(bucketName).build());
+        } catch (S3Exception e) {
+            s3.createBucket(CreateBucketRequest.builder().bucket(bucketName).build());
+        }
+
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .build();
+        this.objectMapper = new ObjectMapper();
+    }
+
+    @Scheduled(fixedDelay = 10_000)
+    public void pollBucket() {
+        ListObjectsV2Response response = s3.listObjectsV2(
+                ListObjectsV2Request.builder()
+                        .bucket(bucketName)
+                        .prefix("uploads/")
+                        .build()
+        );
+
+        List<S3Object> objects = response.contents();
+        if (objects == null || objects.isEmpty()) {
+            return;
+        }
+
+        for (S3Object obj : objects) {
+            String key = obj.key();
+
+            if (!key.endsWith(".txt") || processedKeys.contains(key)) {
+                continue;
+            }
+
+            try {
+                ResponseBytes<GetObjectResponse> bytes = s3.getObjectAsBytes(
+                        GetObjectRequest.builder()
+                                .bucket(bucketName)
+                                .key(key)
+                                .build()
+                );
+
+                String text = bytes.asString(StandardCharsets.UTF_8);
+                System.out.println("Processing text object from S3: " + key);
+
+                String id = key.replace("/", "_");
+                sendToChroma(id, text, key);
+
+                processedKeys.add(key);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void sendToChroma(String id, String text, String sourceKey) {
+        try {
+            var payload = new ChromaEmbedRequest(id, text, sourceKey);
+            String json = objectMapper.writeValueAsString(payload);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(chromaServiceUrl + "/embed"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            System.out.println("Chroma response (" + id + "): " + response.statusCode() + " " + response.body());
+        } catch (Exception e) {
+            System.err.println("Error sending to Chroma for id " + id + ": " + e.getMessage());
+        }
+    }
+
+    public static class ChromaEmbedRequest {
+        public String id;
+        public String text;
+        public Metadata metadata;
+
+        public ChromaEmbedRequest(String id, String text, String sourceKey) {
+            this.id = id;
+            this.text = text;
+            this.metadata = new Metadata(sourceKey);
+        }
+    }
+
+    public static class Metadata {
+        public String source;
+
+        public Metadata() {
+        }
+
+        public Metadata(String source) {
+            this.source = source;
+        }
+    }
+}

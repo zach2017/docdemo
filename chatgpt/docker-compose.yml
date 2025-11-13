@@ -1,0 +1,80 @@
+version: "3.9"
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: localstack
+    environment:
+      - SERVICES=s3
+      - DEBUG=1
+      - DATA_DIR=/var/lib/localstack/data
+      - AWS_DEFAULT_REGION=us-east-1
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack-data:/var/lib/localstack
+    networks:
+      - app-net
+
+  web:
+    build: ./web
+    container_name: web
+    environment:
+      - API_URL=http://unstructured:8000
+    ports:
+      - "8080:3000"
+    depends_on:
+      - unstructured
+    networks:
+      - app-net
+
+  unstructured:
+    build: ./unstructured
+    container_name: unstructured
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - S3_ENDPOINT_URL=http://localstack:4566
+      - S3_BUCKET_NAME=documents
+    depends_on:
+      - localstack
+    networks:
+      - app-net
+
+  java-worker:
+    build: ./java-worker
+    container_name: java-worker
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+      - S3_ENDPOINT=http://localstack:4566
+      - S3_BUCKET_NAME=documents
+      - CHROMA_SERVICE_URL=http://chroma-service:9000
+    depends_on:
+      - localstack
+      - chroma-service
+    networks:
+      - app-net
+
+  chroma-service:
+    build: ./chroma-service
+    container_name: chroma-service
+    environment:
+      - CHROMA_DB_DIR=/data/chroma
+      - CHROMA_COLLECTION_NAME=documents
+    volumes:
+      - chroma-data:/data/chroma
+    ports:
+      - "9000:9000"
+    networks:
+      - app-net
+
+volumes:
+  localstack-data:
+  chroma-data:
+
+networks:
+  app-net:
+    driver: bridge
